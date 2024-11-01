@@ -1,0 +1,797 @@
+---
+title: "Figures Biogeography"
+author: "Susheel Bhanu Busi"
+date: "2024-04-08"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r dependencies}
+library(tidyverse)
+library(mgcv)
+library(data.table)
+library(gt)
+library(vegan)
+library(randomForest)
+library(smacof)
+library(ampvis2)
+library(Maaslin2)
+library(readxl)
+library(ggsci)
+library(ggalluvial)
+library(pheatmap)
+library(ggpubr)
+library(geosphere)
+library(here)
+```
+
+```{r working directory}
+here::i_am("leila_figures_20240406.Rmd")
+here()
+```
+
+```{r theme setting}
+# setting a common theme for plotting
+theme_set(theme_bw() +
+            theme(strip.background = element_rect(colour = "black", fill = "white"), strip.text = element_text(size=17, family="Helvetica")) +
+            theme(axis.text.x = element_text(angle = 90, size = 18, family = "Helvetica"),
+                  axis.text.y = element_text(size = 18, family = "Helvetica"),
+                  axis.title.y = element_text(size = 18, face = "bold", family = "Helvetica"),
+                  axis.title.x=element_text(size = 18, face = "bold", family = "Helvetica"),
+                  axis.ticks.x=element_blank()) +
+            theme(plot.title = element_text(hjust = 0.5, size = 20, family = "Helvetica", face = "bold")) +
+            theme(legend.text = element_text(size = 18, family = "Helvetica"),
+                  legend.title = element_text(size = 18, family = "Helvetica", face = "bold"), legend.direction = "vertical", legend.box = "vertical"))
+```
+
+```{r}
+# Functions
+clean_sample_name <- function(raw_name){
+  raw_name = gsub('DownB', 'DN', raw_name)
+  raw_name = gsub('UpB', 'UP', raw_name)
+  raw_name = gsub('Down', 'DN', raw_name)
+  clean_name = gsub('Up', 'UP', raw_name)
+  return(clean_name)}
+```
+
+```{r reading in files}
+# KEGG counts
+kegg <- read.csv(file = "NOMIS_merged_KEGG_counts_20240104.csv", check.names = FALSE)
+proks_only <- read.delim("prokaryoteKOs_only_NOMIS.txt")
+tmp <- kegg %>% filter(Geneid %in% proks_only$kegg)
+kegg <- tmp
+
+merged_metadata <- read.csv("merged_metadata.csv")
+```
+
+```{r averaging the UP/DN values per glacier}
+#Identify unique prefixes
+prefixes <- unique(sub("_.*", "", names(kegg)))
+
+#Calculate averages for each prefix
+averages_list <- map(prefixes, ~{
+  prefix <- .x
+  
+  # Select columns with "_UP" or "_DN" for the current prefix
+  prefix_columns <- select(kegg, starts_with(paste0(prefix, "_UP")), starts_with(paste0(prefix, "_DN")))
+  
+  # Calculate row-wise averages for the selected columns
+  prefix_average <- rowMeans(prefix_columns, na.rm = TRUE)
+  
+  # Round the averages to integers
+  prefix_average <- round(prefix_average)
+  
+  # Create a dataframe with the prefix and its corresponding average
+  tibble(!!paste0(prefix, "_Average") := prefix_average)
+})
+
+#Combine the average dataframes into a single dataframe
+averages_kegg <- bind_cols(averages_list)
+
+#Remove columns where all values are NaN
+averages_kegg <- averages_kegg %>%
+  select(which(!apply(is.na(averages_kegg), 2, function(x) all(x))))
+
+#Remove the string "_Average" from the column names
+names(averages_kegg) <- gsub("_Average", "", names(averages_kegg))
+
+#Combine the averages with non-UP and DN columns
+result <- cbind(select(kegg, -ends_with("_UP"), -ends_with("_DN")), averages_kegg)
+
+# write to file
+write.csv(result, "averaged_NOMIS_KEGG_counts.csv", row.names = FALSE)
+```
+
+```{r merging with 'Rest of World, row' data}
+# Reading KEGG counts and metadata for REST OF THE WORLD, i.e. row, samples
+row <- read.csv("MTG_KEGG_counts.tsv", sep= "\t") %>% 
+  filter(Geneid %in% proks_only$kegg)
+
+nomis_row <- full_join(result, row, by = "Geneid")
+nomis_row_metadata <- read.csv("NOMIS_ROW_Metadata_20240406.csv") 
+rownames(nomis_row_metadata) <- nomis_row_metadata$Sample
+
+# Comparative analyses - MaAsLin2
+nomis_row_maaslin2 <- nomis_row %>% column_to_rownames(., var = "Geneid")
+log_nomis_row <- log1p(nomis_row_maaslin2)
+write.csv(nomis_row_maaslin2, "nomis_row_matrix_20240406.csv")
+```
+
+```{r statistical analyses - MAAsLin2, echo=FALSE, results='hide'}
+# removing DOWN sites and non-cryospheric samples
+nomis_row_maaslin2_dedup <- nomis_row_maaslin2[, !duplicated(t(nomis_row_maaslin2))]
+nomis_row_maaslin2_sed <- nomis_row_maaslin2_dedup %>%  select(-matches("GLR"))
+
+fit_data <- Maaslin2(
+  nomis_row_maaslin2, nomis_row_metadata, 'nomis_row_maaslin2_20240415', transform = "None",
+  fixed_effects = c('Type', 'Subtype'),
+  standardize = FALSE)
+```
+
+```{r}
+fulldata <- log_nomis_row %>% rownames_to_column(., var = "Geneid")
+fulldata_edited <- fulldata %>%
+  select(-c("336R", "337R", "338R", "339R", "340R", "341R")) %>%
+  mutate(Kingdom = Geneid, Phylum = Geneid, Class = Geneid, Order = Geneid,
+         Family = Geneid, Genus = Geneid, Species = Geneid) %>%
+  dplyr::mutate(OTU = paste0("OTU", 1:nrow(.))) %>%
+  relocate(OTU) %>%
+  select(-Geneid)
+
+# adding fake k__, p__, g__ etc
+fulldata_otu_edited <- fulldata_edited %>% 
+  mutate(Kingdom = paste0("k__", Kingdom), 
+         Phylum = paste0("k__", Phylum), 
+         Class = paste0("c__", Class), 
+         Order = paste0("o__", Order), 
+         Family = paste0("f__", Family), 
+         Genus = paste0("g__", Genus), 
+         Species = paste0("s__", Species))
+
+nomis_row_maaslin2_dedup <- fulldata_otu_edited[, !duplicated(t(fulldata_otu_edited))]
+nomis_row_maaslin2_sed <- nomis_row_maaslin2_dedup %>% select(-matches("GLR"))
+write.csv(nomis_row_maaslin2_sed, "nomis_row_averaged_sed_20240415.csv", row.names = TRUE)
+
+# Load data into ampvis
+amp_meta <- nomis_row_metadata %>% rename(sampleid = Sample)
+
+# loading table
+d <- amp_load(otutable = nomis_row_maaslin2_sed,
+              metadata = amp_meta)
+# WITH MARINE
+# filtered_d <- amp_subset_samples(data = d, Ecosystem %in% c("GFS", "Ice_Snow", "Marine"))
+# filtered_d <- amp_subset_samples(data = filtered_d, Habitat %in% c("Cryoconite", "Glacier ice", "Polar desert sand", "sediment", "Water"))
+
+# WITHOUT MARINE
+filtered_d <- amp_subset_samples(data = d, Ecosystem %in% c("GFS", "Ice_Snow"))
+filtered_d <- amp_subset_samples(data = filtered_d, Habitat %in% c("Cryoconite", "Glacier ice", "Polar desert sand", "sediment"))
+```
+```{r ampvis plots}
+# Ordination
+amp_ordinate(filtered_d,
+             type = "pcoa",
+             distmeasure = "bray",
+             sample_color_by = "Ecosystem",
+             sample_shape_by = "Habitat",
+             sample_colorframe = TRUE,
+             sample_colorframe_label = "Project") #+ theme(legend.position = "blank")
+
+# Canonical correlation analyses
+ordinationresult <- amp_ordinate(filtered_d,
+                                 type = "PCoA",
+                                 constrain = "type",
+                                 transform = "Hellinger",
+                                 sample_color_by = "Habitat",
+                                 sample_shape_by = "Ecosystem",
+                                 sample_colorframe = FALSE,
+                                 sample_colorframe_label = "Ecosystem",
+                                 detailed_output = TRUE,
+                                 filter_species = 0.001)
+ordinationresult$plot + theme(axis.text.x = element_text(size=16, vjust = 1, face="bold"),
+                              axis.text.y = element_text(size=16, vjust = 1, face="bold"),
+                              axis.title.x = element_text(size=16, vjust = 1, face="bold"),
+                              axis.title.y = element_text(size=16, vjust = 1, face="bold"),
+                              legend.position="right")
+```
+
+```{r}
+ordinationresult <- amp_ordinate(filtered_d,
+                                 type = "PCoA",
+                                 constrain = "type",
+                                 transform = "Hellinger",
+                                 sample_color_by = "Site",
+                                 sample_shape_by = "Ecosystem",
+                                 sample_colorframe = FALSE,
+                                 sample_colorframe_label = "Ecosystem",
+                                 detailed_output = TRUE,
+                                 filter_species = 0.001)
+ordinationresult$plot + theme(axis.text.x = element_text(size=16, vjust = 1, face="bold"),
+                              axis.text.y = element_text(size=16, vjust = 1, face="bold"),
+                              axis.title.x = element_text(size=16, vjust = 1, face="bold"),
+                              axis.title.y = element_text(size=16, vjust = 1, face="bold"),
+                              legend.position="right")
+```
+
+```{r}
+### Ordination with biplot
+ordinationresult_biplot <- amp_ordinate(filtered_d,
+                                 type = "PCA",
+                                 constrain = "type",
+                                 transform = "Hellinger",
+                                 sample_color_by = "Habitat",
+                                 sample_shape_by = "Ecosystem",
+                                 sample_colorframe = FALSE,
+                                 sample_colorframe_label = "Ecosystem",
+                                 sample_point_size = 5,
+                                 detailed_output = TRUE,
+                                 filter_species = 0.001,
+                                 species_plot = TRUE,
+                                 species_label_taxonomy = "Genus",
+                                 species_nlabels = 15,
+                                 species_rescale = TRUE,
+                                 species_point_size = 0.0005,
+                                 species_shape = 1,
+                                 opacity = 0.6,
+                                 repel_labels = FALSE)
+ordinationresult_biplot$plot +
+  theme(axis.text.x = element_text(size=16, vjust = 1, face="bold"),
+  axis.text.y = element_text(size=16, vjust = 1, face="bold"),
+  axis.title.x = element_text(size=16, vjust = 1, face="bold"),
+  axis.title.y = element_text(size=16, vjust = 1, face="bold"),
+  legend.position="right")
+```
+
+```{r}
+# NMDS
+ordinationresult_biplot <- amp_ordinate(filtered_d,
+                                        type = "NMDS",
+                                        constrain = "type",
+                                        transform = "Hellinger",
+                                        sample_color_by = "Habitat",
+                                        sample_shape_by = "Ecosystem",
+                                        sample_colorframe = FALSE,
+                                        sample_colorframe_label = "Ecosystem",
+                                        sample_point_size = 5,
+                                        detailed_output = TRUE,
+                                        filter_species = 0.001,
+                                        species_plot = TRUE,
+                                        species_label_taxonomy = "Genus",
+                                        species_nlabels = 35,
+                                        species_rescale = TRUE,
+                                        species_point_size = 0.0005,
+                                        species_shape = 1,
+                                        opacity = 0.6,
+                                        repel_labels = TRUE)
+ordinationresult_biplot$plot +
+  theme(axis.text.x = element_text(size=16, vjust = 1, face="bold"),
+        axis.text.y = element_text(size=16, vjust = 1, face="bold"),
+        axis.title.x = element_text(size=16, vjust = 1, face="bold"),
+        axis.title.y = element_text(size=16, vjust = 1, face="bold"),
+        legend.position="right")
+```
+
+```{r updated plot}
+# amp_ordinate with significance
+amp_ordinate(filtered_d, filter_species = 0.01, type = "PCA",
+             distmeasure = "bray", transform = "hellinger", constrain = NULL,
+             x_axis = 1, y_axis = 2, print_caption = FALSE,
+             sample_color_by = "Ecosystem", sample_color_order = NULL,
+             sample_shape_by = "Project", sample_colorframe = TRUE,
+             sample_colorframe_label = NULL, sample_colorframe_label_size = 3,
+             sample_label_by = NULL, sample_label_size = 4,
+             sample_label_segment_color = "black", sample_point_size = 2,
+             sample_trajectory = NULL, sample_trajectory_group = NULL,
+             sample_plotly = NULL, species_plot = FALSE, species_nlabels = 0,
+             species_label_taxonomy = "Genus", species_label_size = 3,
+             species_label_color = "grey10", species_rescale = FALSE,
+             species_point_size = 2, species_shape = 20, species_plotly = FALSE,
+             envfit_factor = "Ecosystem", envfit_numeric = NULL,
+             envfit_signif_level = 0.05, envfit_textsize = 3,
+             envfit_textcolor = "darkred", envfit_numeric_arrows_scale = 1,
+             envfit_arrowcolor = "darkred", envfit_show = TRUE,
+             repel_labels = TRUE, opacity = 0.8, tax_empty = "best",
+             detailed_output = TRUE, num_threads = 1L)
+updated_fig <- amp_ordinate(filtered_d, filter_species = 0.01,
+                            type = "PCA",
+                            distmeasure = "bray",
+                            transform = "hellinger", constrain = NULL,
+                            x_axis = 1, y_axis = 2, print_caption = FALSE,
+                            sample_color_by = "Habitat",
+                            sample_color_order = NULL,
+                            sample_shape_by = "Project",
+                            sample_colorframe = FALSE,
+                            sample_colorframe_label = "Habitat",
+                            sample_colorframe_label_size = 3,
+                            sample_label_by = NULL,
+                            sample_label_size = 0,
+                            sample_label_segment_color = "black",
+                            sample_point_size = 2,
+                            sample_trajectory = NULL,
+                            sample_trajectory_group = NULL,
+                            sample_plotly = NULL,
+                            species_plot = FALSE,
+                            species_nlabels = 0,
+                            species_label_taxonomy = "Genus",
+                            species_label_size = 3,
+                            species_label_color = "grey10",
+                            species_rescale = FALSE,
+                            species_point_size = 2,
+                            species_shape = 20, species_plotly = FALSE,
+                            envfit_factor = "Habitat",
+                            envfit_numeric = NULL,
+                            envfit_signif_level = 0.05,
+                            envfit_textsize = 0,
+                            envfit_textcolor = "darkred",
+                            envfit_numeric_arrows_scale = 1,
+                            envfit_arrowcolor = "darkred",
+                            envfit_show = TRUE,
+                            repel_labels = TRUE,
+                            opacity = 0.8, tax_empty = "best",
+                            detailed_output = TRUE, num_threads = 1L)
+updated_fig$plot + theme(axis.text.x = element_text(size=16, vjust = 1, face="bold"),
+                         axis.text.y = element_text(size=16, vjust = 1, face="bold"),
+                         axis.title.x = element_text(size=16, vjust = 1, face="bold"),
+                         axis.title.y = element_text(size=16, vjust = 1, face="bold"),
+                         legend.position="right")
+
+```
+
+```{r Supplementary figure - GFS samples only}
+# subsetting to keep only the GFS samples
+filtered_d_GFS <- ampvis2::amp_filter_samples(filtered_d, Ecosystem=="GFS")
+
+# Define the level renaming
+level_renaming <- c(
+  "European Alps" = "Alps",
+  "Caucasus mountains" = "Caucasus",
+  "Ecuadorian Andes" = "Ecuador",
+  "Southwest Greenland" = "Greenland",
+  "Himalayas" = "Nepal",
+  "Southern Alps" = "New_Zealand",
+  "Pamir & Tien Shan" = "Kyrgyzstan",
+  "Scandinavian mountains" = "Norway",
+  "Rwenzori mountains" = "Uganda"
+)
+# colors for the sites
+new_site_colors <- c(
+  `European Alps` = "#CD519D",
+  `Caucasus mountains` = "#8D59A4",
+  `Ecuadorian Andes` = "#825A24",
+  `Chilean Andes` = "#825A24",
+  `Southwest Greenland` = "#3151A0",
+  Himalayas = "#97A0A6",
+  `Southern Alps` = "#C0DC86",
+  `Pamir & Tien Shan` = "#E5614C",
+  `Scandinavian mountains` = "#DC9441",
+  `Rwenzori mountains` = "#EED13E"
+)
+
+
+# switching to ampvis for plotting
+ordinationresult_KOs <- amp_ordinate(filtered_d_GFS,
+                                     type = "PCA",
+                                     constrain = "type",
+                                     distmeasure = "canberra",
+                                     transform = "Hellinger",
+                                     sample_color_by = "Site",
+                                     sample_point_size =  5,
+                                     sample_colorframe = FALSE,
+                                     detailed_output = TRUE,
+                                     filter_species = 0.001,
+                                     species_plot = TRUE,
+                                     species_label_taxonomy = "Genus",
+                                     species_nlabels = 25,
+                                     species_rescale = TRUE,
+                                     species_point_size = 0.0005,
+                                     species_shape = 1,
+                                     opacity = 0.6,)
+
+ordinationresult_KOs$plot  + theme_classic() + 
+  theme(axis.text.x = element_text(size=16, vjust = 1, face="bold"),
+                                      axis.text.y = element_text(size=16, vjust = 1, face="bold"),
+                                      axis.title.x = element_text(size=16, vjust = 1, face="bold"),
+                                      axis.title.y = element_text(size=16, vjust = 1, face="bold"),
+                                      legend.position="right")
+
+# Convert 'Site' to a character vector and then rename levels
+ordinationresult_KOs$plot$data$Site <- as.character(ordinationresult_KOs$plot$data$Site)
+ordinationresult_KOs$plot$data$Site <- fct_recode(ordinationresult_KOs$plot$data$Site, !!!level_renaming)
+
+# plot code to include the updated 'Site' variable
+ordinationresult_KOs$plot +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(size = 16, vjust = 1, face = "bold"),
+    axis.text.y = element_text(size = 16, vjust = 1, face = "bold"),
+    axis.title.x = element_text(size = 16, vjust = 1, face = "bold"),
+    axis.title.y = element_text(size = 16, vjust = 1, face = "bold"),
+    legend.position = "right"
+  ) +
+  scale_color_manual(values = new_site_colors) +
+  labs(color = "Mountain ranges")
+```
+
+
+```{r plotting significant pathways}
+sig_maaslin_kegg <- read.delim(here("nomis_row_maaslin2_20240415/significant_results.tsv")) %>%
+  filter(qval < 0.05, metadata == "Type") %>%
+  rename("ko" = feature)
+
+kegg_path <- read.delim(here("keggPathwayGood.txt"))
+sig_maaslin_kegg_path <- left_join(sig_maaslin_kegg, kegg_path, by = "ko") %>% filter(ko %in% proks_only$kegg)
+
+# merging differential analyses with KO abundances
+ko_abund <- nomis_row %>% select(-matches("GLR")) %>% column_to_rownames(., var = "Geneid")
+ko_abund_log <- log1p(ko_abund) %>% rownames_to_column(., var = "ko")
+sig_maaslin_kegg_merged <- left_join(sig_maaslin_kegg_path, ko_abund_log, by = "ko" )
+
+# tally
+sort(table(sig_maaslin_kegg_path$Pathway), decreasing = TRUE)
+
+sig_maaslin_kegg_path %>%
+  filter(coef < 0) %>%
+  dplyr::count(Pathway) %>%
+  arrange(desc(n))
+
+# tally of pathways enriched in GFS
+sig_maaslin_kegg_gfs_enriched <- sig_maaslin_kegg_path %>%
+  filter(coef < 0) %>%
+  dplyr::count(Pathway) %>%
+  arrange(desc(n)) %>%
+  mutate(gfs_enriched = n) %>%
+  select(-n)
+
+# GFS abundance of significant pathways
+sig_maaslin_kegg_gfs_enriched_abund <- sig_maaslin_kegg_merged %>% 
+    select(-matches("GLR")) %>%
+  select(-matches("RR")) %>%
+    filter(coef < 0) %>%
+    select(-c(metadata, value, coef, N, "N.not.0", pval, qval, Path_1, Path_2, Description)) %>% 
+  group_by(Pathway) %>% 
+  summarise_if(is.numeric, sum, na.rm = TRUE)
+
+
+# tally of pathways enriched in row, i.e. ice/snow, marine samples
+sig_maaslin_kegg_row_enriched <- sig_maaslin_kegg_path %>%
+  filter(coef > 0) %>%
+  dplyr::count(Pathway) %>%
+  arrange(desc(n)) %>%
+  mutate(row_enriched = n) %>%
+  select(-n)
+
+# ROW abundance of signficant pathways
+sig_maaslin_kegg_row_enriched_abund <- sig_maaslin_kegg_merged %>% 
+  filter(coef > 0) %>%
+  select(-c(metadata, value, coef, N, stderr, "N.not.0", pval, qval, Path_1, Path_2, Description)) %>% 
+  select(ko, Pathway, matches("RR")) %>%
+  group_by(Pathway) %>% 
+  summarise_if(is.numeric, sum, na.rm = TRUE)
+
+# merging the two tables
+merged_sig_maaslin_table <- full_join(sig_maaslin_kegg_gfs_enriched, sig_maaslin_kegg_row_enriched, by = "Pathway") %>%
+  mutate(Pathway = str_replace(Pathway, "^\\d+\\s", "")) %>%
+  mutate(Pathway = if_else(is.na(Pathway), "No annotation", Pathway)) %>%
+  group_by(Pathway) %>%
+  summarise(across(where(is.numeric), sum))
+
+# merging the abundance tables
+merged_sig_maaslin_table_abund <- full_join(sig_maaslin_kegg_gfs_enriched_abund, sig_maaslin_kegg_row_enriched_abund, by = "Pathway") %>%
+  mutate(Pathway = str_replace(Pathway, "^\\d+\\s", "")) %>%
+  mutate(Pathway = if_else(is.na(Pathway), "No annotation", Pathway)) %>%
+  group_by(Pathway) %>%
+  summarise(across(where(is.numeric), sum))
+
+write.csv(merged_sig_maaslin_table, "merged_maaslin_sig_pathways_KEGG_20240415.csv", row.names = FALSE)
+write.csv(merged_sig_maaslin_table_abund, "merged_maaslin_sig_pathways_abund_KEGG_20240415.csv", row.names = FALSE)
+```
+
+```{r heatmap}
+test_kegg_heat <- merged_sig_maaslin_table %>%
+  column_to_rownames(., var = "Pathway") %>%
+  as.matrix()
+
+# Impute missing values with column means
+test_kegg_heat[is.na(test_kegg_heat)] <- colMeans(test_kegg_heat, na.rm = TRUE)
+
+pheatmap(test_kegg_heat,
+     #    cutree_rows = 4,
+         cutree_cols = 2,
+         show_rownames = FALSE,
+         treeheight_col = 20)
+
+# log10 scale
+pheatmap(log10(test_kegg_heat),
+         cutree_rows = 6,
+         cutree_cols = 2,
+         show_rownames = TRUE,
+         treeheight_col = 20)
+
+# heatmap - top 50
+test_kegg_heat_50 <- merged_sig_maaslin_table %>%
+  top_n(50, gfs_enriched) %>%
+  column_to_rownames(., var = "Pathway") %>%
+  as.matrix()
+
+# Impute missing values with column means
+test_kegg_heat_50[is.na(test_kegg_heat_50)] <- colMeans(test_kegg_heat_50, na.rm = TRUE)
+
+pheatmap(test_kegg_heat_50,
+         cutree_rows = 6,
+         cutree_cols = 2,
+         show_rownames = TRUE,
+         treeheight_col = 20)
+
+# log10 scale
+pheatmap(log10(test_kegg_heat_50),
+         cutree_rows = 3,
+         cutree_cols = 2,
+         show_rownames = TRUE,
+         treeheight_col = 20)
+# log10 scale - different clustering
+pheatmap(log10(test_kegg_heat_50),
+         cutree_rows = 3,
+         clustering_distance_rows = "minkowski",
+         cutree_cols = 2,
+         show_rownames = TRUE,
+         treeheight_col = 20, 
+         filename = "updated_heatmap_count_20240415.pdf")
+
+pheatmap(log10(test_kegg_heat_50),
+         cutree_rows = 3,
+         clustering_distance_rows = "minkowski",
+         cutree_cols = 2,
+         show_rownames = TRUE,
+         treeheight_col = 20)
+```
+
+```{r ABUNDANCE heatmap}
+kegg_heat <- merged_sig_maaslin_table_abund %>%
+  column_to_rownames(., var = "Pathway") %>%
+  as.matrix()
+
+# Impute missing values with column means
+kegg_heat[is.na(kegg_heat)] <- colMeans(kegg_heat, na.rm = TRUE)
+
+pheatmap(kegg_heat,
+     #    cutree_rows = 4,
+         cutree_cols = 2,
+         show_rownames = FALSE,
+         treeheight_col = 20)
+
+# heatmap - top 50
+kegg_heat_50 <- merged_sig_maaslin_table_abund %>%
+  top_n(50, GL122) %>%
+  column_to_rownames(., var = "Pathway") %>%
+  as.matrix()
+
+# Impute missing values with column means
+kegg_heat_50[is.na(kegg_heat_50)] <- colMeans(kegg_heat_50, na.rm = TRUE)
+kegg_heat_final <- kegg_heat_50 %>% round()
+
+pheatmap(kegg_heat_final,
+         cutree_rows = 6,
+         cutree_cols = 2,
+         show_rownames = TRUE,
+         treeheight_col = 20)
+
+# log10 scale
+pheatmap(log1p(kegg_heat_final),
+         cutree_rows = 3,
+         cutree_cols = 2,
+         show_rownames = TRUE,
+         treeheight_col = 20)
+
+# log10 scale - different clustering
+pheatmap(log1p(kegg_heat_final),
+         cutree_rows = 3,
+         clustering_distance_rows = "minkowski",
+         cutree_cols = 2,
+         show_rownames = TRUE,
+         treeheight_col = 20, 
+         filename = "updated_heatmap_20240415.pdf")
+
+pheatmap(log1p(kegg_heat_final),
+         cutree_rows = 3,
+         clustering_distance_rows = "minkowski",
+         cutree_cols = 2,
+         show_rownames = TRUE,
+         treeheight_col = 20)
+```
+
+```{r Distance decay plots}
+# kegg data prep
+otu_mat <- result %>% 
+  select(-matches("R")) %>% 
+  column_to_rownames(var = "Geneid") 
+
+# Preparing data
+# creating df with colnames and keeping relevant metadata only
+otu_mat_df <- as.data.frame(colnames(otu_mat)) %>% rename("Sample"=`colnames(otu_mat)`) %>% 
+  mutate(edited_Sample =  str_replace(Sample, "_.*$", ""))
+
+le_meta <- read_tsv("metadata_NOMIS_Leila.txt") # leila's metadata
+otu_mat_df <- otu_mat_df %>% left_join(le_meta, by = c("edited_Sample"="sample")) %>% 
+  select(-edited_Sample) 
+```
+
+```{r}
+# Calculate Bray-Curtis dissimilarity matrix
+bray_curtis_matrix <- vegdist(t(otu_mat), method = "bray") # transposing to match with the metadata
+bray_curtis_matrix_mat <- as.matrix(bray_curtis_matrix)
+
+# Calculate Sørensen dissimilarity matrix
+sorensen_matrix <- vegdist(t(otu_mat), method = "jaccard") # transposing to match with the metadata
+sorensen_matrix_mat <- as.matrix(sorensen_matrix)
+
+# Calculate geographic distances between points using geosphere package
+# Assuming you have latitude and longitude information in 'matrix2'
+otu_mat_dist <- otu_mat_df %>% select(Sample, lon, lat) %>% column_to_rownames(., var = "Sample") %>% as.matrix()
+geographic_distances <- distm(otu_mat_dist, fun=distGeo)
+rownames(geographic_distances) <- rownames(otu_mat_dist)
+colnames(geographic_distances) <- rownames(otu_mat_dist)
+
+# Create a dataframe for Bray-Curtis dissimilarity vs. Geographic distances
+bray_curtis_df <- data.frame(
+  Dissimilarity  = as.vector(bray_curtis_matrix_mat),
+  GeographicDistance = as.vector(geographic_distances),
+  Type="Bray-Curtis"
+)
+
+# Create the scatter plot for Bray-Curtis dissimilarity vs. Geographic distance
+bray_curtis_plot <- ggplot(bray_curtis_df, aes(x = log10(GeographicDistance), y = Dissimilarity )) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +  # Add linear trendline
+  stat_cor(method = "pearson", label.x = 0.8, label.y = 0.6, label.sep = 0.1, size = 4) +  # Add correlation coefficient
+  labs(
+    x = "Geographic Distance",
+    y = "Bray-Curtis Dissimilarity",
+    title = "Bray-Curtis Dissimilarity vs. Geographic Distance",
+  )
+# Print the plot
+bray_curtis_plot
+
+
+# Create a dataframe for Sørensen dissimilarity vs. Geographic distances
+sorensen_df <- data.frame(
+  Dissimilarity  = as.vector(sorensen_matrix_mat),
+  GeographicDistance = as.vector(geographic_distances),
+  Type = "Sorenson"
+)
+
+# Create the scatter plot for Sørensen dissimilarity vs. Geographic distance
+sorensen_plot <- ggplot(sorensen_df, aes(x = log10(GeographicDistance), y = Dissimilarity )) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +  # Add linear trendline
+  stat_cor(method = "pearson", label.x = 0.8, label.y = 0.75, label.sep = 0.1, size = 4) +  # Add correlation coefficient
+  labs(
+    x = "Geographic Distance",
+    y = "Sørensen Dissimilarity",
+    title = "Sørensen Dissimilarity vs. Geographic Distance",
+  )
+# Print the plot
+sorensen_plot
+```
+
+```{r plots with colors}
+# Combine data frames
+combined_df <- rbind(bray_curtis_df, sorensen_df)
+
+# Define custom colors
+custom_colors <- c("Bray-Curtis" = "blue", "Sorenson" = "darkgreen")
+# Create the scatter plot with trendlines and custom colors
+ggplot(combined_df, aes(x = GeographicDistance, y = Dissimilarity, color = Type)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_text(
+    aes(
+      x = max(GeographicDistance),
+      y = min(Dissimilarity),
+      label = paste(
+        "R^2 =", round(summary(lm(Dissimilarity ~ GeographicDistance))$r.squared, 2),
+        "Slope =", round(coef(lm(Dissimilarity ~ GeographicDistance))[2], 2)
+      )
+    ),
+    hjust = 1, vjust = 0
+  ) +
+  labs(
+    x = "Geographic Distance",
+    y = "Dissimilarity",
+    title = "Scatter Plot of Dissimilarity vs. Geographic Distance"
+  ) +
+  scale_color_manual(values = custom_colors)
+```
+
+```{r Regression statistics}
+# Calculate regression statistics
+lm_summary <- summary(lm(Dissimilarity ~ GeographicDistance, data = combined_df))
+r_squared <- round(lm_summary$r.squared, 2)
+slope <- round(lm_summary$coefficients[2], 2)
+equation <- sprintf("Dissimilarity = %.2f * GeographicDistance + %.2f", slope, lm_summary$coefficients[1])
+```
+
+```{r Distnace converted to kilometers}
+ggplot(combined_df, aes(x = GeographicDistance / 1000, y = Dissimilarity, color = Type)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_text(
+    aes(
+      x = max(GeographicDistance / 1000),
+      y = min(Dissimilarity),
+      label = paste("R^2 =", r_squared
+                    #, "\nSlope =", slope, "\nEquation:", equation
+      )
+    ),
+    hjust = 1, vjust = 0
+  ) +
+  labs(
+    x = "Geographic Distance (km)",  # Updated x-axis label
+    y = "Dissimilarity",
+    title = "Scatter Plot of Dissimilarity vs. Geographic Distance"
+  ) +
+  scale_color_manual(
+    values = custom_colors,
+    labels = c("Bray-Curtis", "Sørensen")  # Set custom legend labels
+  ) + 
+  theme(axis.text.x = element_text(family="Helvetica", angle = 0, face="bold", color = "black")) + 
+  theme(axis.text.y = element_text(family="Helvetica", face="bold", color = "black"))
+```
+
+```{r Adding the R2 and p-value to the plot}
+ggplot(combined_df, aes(x = GeographicDistance / 1000, y = Dissimilarity, color = Type)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Geographic Distance (km)",  # Updated x-axis label
+    y = "Dissimilarity",
+    title = "Scatter Plot of Dissimilarity vs. Geographic Distance"
+  ) +
+  scale_color_manual(
+    values = custom_colors,
+    labels = c("Bray-Curtis", "Sørensen")  # Set custom legend labels
+  ) +  # Add linear trendline
+  stat_cor(method = "spearman", label.x = 0.8, label.y = 0.9, label.sep = ";", size = 6) +
+  theme(axis.text.x = element_text(angle = 0))
+```
+
+```{r Running PERMANOVA on Ordination data}
+library(microeco)
+# microeco object
+dataset <- microtable$new(
+  sample_table = filtered_d$metadata, 
+  otu_table = filtered_d$abund, 
+  tax_table = filtered_d$tax)
+
+d1 <- clone(dataset)
+d1$tidy_dataset()
+d1$cal_betadiv()
+t1 <- trans_beta$new(dataset = d1, group = "Ecosystem", measure = "bray")
+
+# manova for all groups when manova_all = TRUE
+t1$cal_manova(manova_all = TRUE)
+t1$res_manova
+```
+
+```{r}
+# calculate and plot sample distances within groups
+t1$cal_group_distance(within_group = TRUE)
+# return t1$res_group_distance
+# perform Wilcoxon Rank Sum and Signed Rank Tests
+t1$cal_group_distance_diff(method = "wilcox")
+# plot_group_order parameter can be used to adjust orders in x axis
+t1$plot_group_distance(boxplot_add = "mean")
+```
+
+```{r}
+t1$cal_manova(manova_all = FALSE)
+t1$res_manova
+```
+
+```{r}
+# manova for specified group set: such as "Group + Type"
+t1$cal_manova(manova_set = "Ecosystem + Habitat")
+t1$res_manova
+```
+
